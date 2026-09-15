@@ -1,11 +1,25 @@
 name: OCI A1 Flex Provisioner
 
+# Authoritative scheduler for A1 Flex capacity retry.
+#
+# Schedule: every 60 minutes, at minute 23 (off the top of the hour).
+# GitHub documents that scheduled workflows can be delayed during periods of
+# high Actions load, and the top of the hour is the most congested slot, so an
+# off-peak minute is used. The long interval is the primary capacity-retry
+# mechanism; bot.py performs only SHORT bounded in-run retries and then exits,
+# so no runner is kept alive waiting for capacity.
+#
+# Runs on the repository default branch (GitHub only fires schedules there).
 on:
   workflow_dispatch:
   schedule:
-    - cron: "*/5 * * * *"
+    - cron: "23 * * * *"
 
 concurrency:
+  # Single group for BOTH trigger types (schedule + workflow_dispatch), so a
+  # manual run and a scheduled run can never execute simultaneously.
+  # cancel-in-progress: false -> an in-flight provisioning run is never killed
+  # mid-launch; a colliding run waits until the current one finishes.
   group: oci-a1-flex-provisioner
   cancel-in-progress: false
 

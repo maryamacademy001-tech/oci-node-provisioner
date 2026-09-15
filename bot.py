@@ -16,8 +16,8 @@ DISPLAY_NAME = os.getenv("OCI_DISPLAY_NAME", "erp-a1-flex-2ocpu-12gb")
 # The GitHub Actions job has timeout-minutes: 5 (300s). MAX_RUNTIME_SECONDS is a
 # self-imposed budget, measured from process start, that must stay below that so
 # the script always exits cleanly (code 2) instead of being killed mid-sleep.
-# The 5-minute scheduler is the primary retry mechanism; in-run retries are only
-# a gentle supplement and must never overrun the job window.
+# The hourly scheduler is the primary capacity-retry mechanism; in-run retries
+# are only a bounded supplement and must never overrun the job window.
 MAX_ATTEMPTS = int(os.getenv("OCI_MAX_ATTEMPTS", "3"))
 MAX_RUNTIME_SECONDS = int(os.getenv("OCI_MAX_RUNTIME_SECONDS", "210"))
 RUN_RESERVE_SECONDS = int(os.getenv("OCI_RUN_RESERVE_SECONDS", "20"))
@@ -239,7 +239,12 @@ def retry_delay(category: str, occurrence: int) -> float:
     return backoff + jitter
 
 
-def instance_already_exists(compute_client, compartment_id: str) -> bool:
+def find_existing_instance(compute_client, compartment_id: str):
+    """Return the live instance matching DISPLAY_NAME, or None if absent.
+
+    TERMINATED/TERMINATING instances are ignored, so a previously deleted
+    instance does not block re-creation.
+    """
     response = compute_client.list_instances(
         compartment_id=compartment_id,
         display_name=DISPLAY_NAME,
@@ -250,8 +255,56 @@ def instance_already_exists(compute_client, compartment_id: str) -> bool:
                 f"Existing instance detected: {instance.display_name} "
                 f"({instance.id}) state={instance.lifecycle_state}"
             )
-            return True
-    return False
+            return instance
+    return None
+
+
+def report_run_context() -> None:
+    """Identify the run: trigger type, workflow run id, and target parameters.
+
+    Uses only GitHub Actions default context variables and target config. No
+    secret values are read or printed.
+    """
+    event = os.getenv("GITHUB_EVENT_NAME", "local")
+    if event == "schedule":
+        trigger = "scheduled"
+    elif event == "workflow_dispatch":
+        trigger = "manual (workflow_dispatch)"
+    else:
+        trigger = event
+
+    print("=== Run Context ===")
+    print(f"trigger: {trigger}")
+    print(f"workflow_run_id: {os.getenv('GITHUB_RUN_ID', 'n/a')}")
+    print(f"run_attempt: {os.getenv('GITHUB_RUN_ATTEMPT', 'n/a')}")
+    print(f"target_display_name: {DISPLAY_NAME}")
+    print(f"target_region: {os.getenv('OCI_REGION', 'n/a')}")
+    print(f"target_shape: {TARGET_SHAPE}")
+    print(f"target_ocpus: {TARGET_OCPUS}")
+    print(f"target_memory_gb: {TARGET_MEMORY_GB}")
+
+
+def report_instance(instance) -> None:
+    """Print a safe, best-effort summary of a created or existing instance.
+
+    Only reads attributes that are already present on the object; missing
+    attributes degrade to 'n/a' and never raise, so reporting can never turn a
+    successful launch into a failed run.
+    """
+
+    def attr(name):
+        return getattr(instance, name, None) or "n/a"
+
+    shape_config = getattr(instance, "shape_config", None)
+    print("=== Instance Summary ===")
+    print(f"display_name: {attr('display_name')}")
+    print(f"ocid: {attr('id')}")
+    print(f"lifecycle_state: {attr('lifecycle_state')}")
+    print(f"availability_domain: {attr('availability_domain')}")
+    print(f"shape: {attr('shape')}")
+    if shape_config is not None:
+        print(f"ocpus: {getattr(shape_config, 'ocpus', 'n/a')}")
+        print(f"memory_in_gbs: {getattr(shape_config, 'memory_in_gbs', 'n/a')}")
 
 
 def main() -> int:
@@ -263,6 +316,7 @@ def main() -> int:
     public_ssh_key = required("OCI_PUBLIC_SSH_KEY")
 
     print("=== OCI A1 Flex Provisioner ===")
+    report_run_context()
     print(f"Region: {config['region']}")
     print(f"Shape: {TARGET_SHAPE}")
     print(f"Target: {TARGET_OCPUS} OCPU / {TARGET_MEMORY_GB} GB RAM")
@@ -312,8 +366,10 @@ def main() -> int:
             f"Requesting {TARGET_SHAPE} in {availability_domain}"
         )
 
-        if instance_already_exists(compute_client, compartment_id):
-            print("Nothing to do: target instance already exists.")
+        existing = find_existing_instance(compute_client, compartment_id)
+        if existing is not None:
+            report_instance(existing)
+            print("RESULT: SUCCESS - Instance already exists.")
             return 0
 
         launch_details = oci.core.models.LaunchInstanceDetails(
@@ -340,11 +396,9 @@ def main() -> int:
 
         try:
             response = compute_client.launch_instance(launch_details)
-            print(
-                "SUCCESS: OCI instance launch accepted. "
-                f"instance_id={response.data.id} "
-                f"lifecycle_state={response.data.lifecycle_state}"
-            )
+            print("Launch accepted by OCI.")
+            report_instance(response.data)
+            print("RESULT: SUCCESS - Instance created successfully.")
             return 0
         except ServiceError as error:
             category = classify_error(error)
@@ -352,6 +406,7 @@ def main() -> int:
 
             if category == NON_RETRYABLE:
                 print(f"NON-RETRYABLE: {summary}")
+                print("RESULT: CONFIGURATION_ERROR - Human intervention required.")
                 return 1
 
             occurrence[category] += 1
@@ -374,7 +429,8 @@ def main() -> int:
             print(f"Waiting {delay:.0f}s before next attempt...")
             time.sleep(delay)
 
-    print("No instance created in this run. The next scheduled run will retry.")
+    print("RESULT: CAPACITY_UNAVAILABLE - No instance created in this run.")
+    print("The next scheduled run will retry.")
     return 2
 
 

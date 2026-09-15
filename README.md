@@ -53,8 +53,8 @@ Retry delay is `base * 2**(n-1) + jitter`, so a `CAPACITY` sequence is
 process always exits cleanly before the Actions job timeout
 (`timeout-minutes: 5`). If the next backoff would not fit the budget, the run
 defers to the next scheduled run instead of being killed mid-flight. The
-`*/5 * * * *` scheduler is the primary retry mechanism; in-run retries are only
-a supplement.
+hourly scheduler is the primary capacity-retry mechanism; in-run retries are
+only a bounded supplement.
 
 ## Idempotency
 
