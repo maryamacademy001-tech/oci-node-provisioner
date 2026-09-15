@@ -107,12 +107,20 @@ def get_availability_domains(identity_client, tenancy_id: str) -> list[str]:
 
 
 def find_oracle_linux_9_arm64_image(compute_client, compartment_id: str) -> str:
-    """Resolve the current Oracle Linux 9 ARM64 image; do not hard-code a regional OCID."""
+    """Resolve the current Oracle Linux 9 ARM64 image; do not hard-code a regional OCID.
+
+    The VM.Standard.A1.Flex shape is ARM64-only, so passing shape=TARGET_SHAPE
+    to list_images() already restricts results to ARM64-compatible images.
+    The Image model in oci==2.186.0 has no 'architecture' attribute, so
+    architecture filtering must rely on shape-based filtering rather than an
+    Image.architecture field check.
+    """
     response = compute_client.list_images(
         compartment_id=compartment_id,
         operating_system="Oracle Linux",
         operating_system_version="9",
         shape=TARGET_SHAPE,
+        lifecycle_state="AVAILABLE",
         sort_by="TIMECREATED",
         sort_order="DESC",
         limit=20,
@@ -121,19 +129,26 @@ def find_oracle_linux_9_arm64_image(compute_client, compartment_id: str) -> str:
     candidates = [
         image for image in response.data
         if (image.lifecycle_state or "").upper() == "AVAILABLE"
-        and (image.architecture or "").lower() in {"aarch64", "arm64"}
     ]
 
     if not candidates:
         raise RuntimeError(
-            "No AVAILABLE Oracle Linux 9 ARM64 image was found for "
-            f"{TARGET_SHAPE} in region {os.getenv('OCI_REGION')}."
+            "No AVAILABLE Oracle Linux 9 image compatible with "
+            f"{TARGET_SHAPE} was found in region {os.getenv('OCI_REGION')}. "
+            "The 'image.architecture' field is not exposed by oci==2.186.0; "
+            "ARM64 compatibility is determined by the shape parameter passed "
+            "to list_images(), which restricts results to images compatible "
+            "with VM.Standard.A1.Flex (an ARM64-only shape)."
         )
 
     selected = candidates[0]
     print(
         f"Selected image: {selected.display_name} | "
-        f"OCID: {selected.id} | architecture: {selected.architecture}"
+        f"OCID: {selected.id} | "
+        f"operating_system: {selected.operating_system} | "
+        f"operating_system_version: {selected.operating_system_version} | "
+        f"lifecycle_state: {selected.lifecycle_state} | "
+        f"launch_mode: {selected.launch_mode}"
     )
     return selected.id
 
