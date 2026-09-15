@@ -1,4 +1,5 @@
 import os
+import random
 import sys
 import time
 
@@ -9,9 +10,33 @@ TARGET_SHAPE = "VM.Standard.A1.Flex"
 TARGET_OCPUS = int(os.getenv("OCI_OCPUS", "2"))
 TARGET_MEMORY_GB = int(os.getenv("OCI_MEMORY_GB", "12"))
 BOOT_VOLUME_GB = int(os.getenv("OCI_BOOT_VOLUME_GB", "100"))
-MAX_ATTEMPTS = int(os.getenv("OCI_MAX_ATTEMPTS", "3"))
-RETRY_DELAY_SECONDS = int(os.getenv("OCI_RETRY_DELAY_SECONDS", "45"))
 DISPLAY_NAME = os.getenv("OCI_DISPLAY_NAME", "erp-a1-flex-2ocpu-12gb")
+
+# --- Retry governance -------------------------------------------------------
+# The GitHub Actions job has timeout-minutes: 5 (300s). MAX_RUNTIME_SECONDS is a
+# self-imposed budget, measured from process start, that must stay below that so
+# the script always exits cleanly (code 2) instead of being killed mid-sleep.
+# The 5-minute scheduler is the primary retry mechanism; in-run retries are only
+# a gentle supplement and must never overrun the job window.
+MAX_ATTEMPTS = int(os.getenv("OCI_MAX_ATTEMPTS", "3"))
+MAX_RUNTIME_SECONDS = int(os.getenv("OCI_MAX_RUNTIME_SECONDS", "210"))
+RUN_RESERVE_SECONDS = int(os.getenv("OCI_RUN_RESERVE_SECONDS", "20"))
+
+# Per-category base delays. Actual delay = base * 2**(occurrence-1) + jitter,
+# i.e. exponential backoff with a random component to avoid a retry storm when
+# multiple scheduled runs overlap. Capacity gets the longest base because A1
+# Flex host availability frees on the order of minutes, not seconds.
+CAPACITY_DELAY_SECONDS = int(os.getenv("OCI_CAPACITY_DELAY_SECONDS", "120"))
+THROTTLE_DELAY_SECONDS = int(os.getenv("OCI_THROTTLE_DELAY_SECONDS", "60"))
+TRANSIENT_DELAY_SECONDS = int(os.getenv("OCI_TRANSIENT_DELAY_SECONDS", "30"))
+RETRY_JITTER_SECONDS = int(os.getenv("OCI_RETRY_JITTER_SECONDS", "30"))
+
+# Explicit error categories. Every ServiceError maps to exactly one of these;
+# no error is silently lumped into a broad bucket.
+CAPACITY = "CAPACITY"
+THROTTLED = "THROTTLED"
+TRANSIENT = "TRANSIENT"
+NON_RETRYABLE = "NON-RETRYABLE"
 
 
 def required(name: str) -> str:
@@ -153,15 +178,65 @@ def find_oracle_linux_9_arm64_image(compute_client, compartment_id: str) -> str:
     return selected.id
 
 
-def is_capacity_error(error: ServiceError) -> bool:
-    message = str(error).lower()
-    code = str(getattr(error, 'code', '')).lower()
-    return (
+def classify_error(error: ServiceError) -> str:
+    """Map an OCI ServiceError to exactly one explicit retry category.
+
+    Classification is deliberately ordered and evidence-based: it inspects the
+    HTTP status, the OCI error code, and the error message text. It never treats
+    a whole status code family as one condition, so a generic 500 is NOT assumed
+    to be capacity, and a 429 is NOT treated as a permanent failure.
+    """
+    status = getattr(error, "status", None)
+    code = str(getattr(error, "code", "") or "").lower()
+    message = str(getattr(error, "message", "") or "").lower()
+    # str(error) includes status/code/message, so it is a superset catch-all for
+    # message text regardless of how the SDK populated the fields.
+    blob = str(error).lower()
+
+    # 1) Throttling: explicit rate limiting. Always retryable, never permanent.
+    if (
+        status == 429
+        or "toomanyrequests" in code
+        or "too many requests" in message
+        or "rate limit" in message
+    ):
+        return THROTTLED
+
+    # 2) Capacity: A1 Flex host/AD availability. Retryable with long backoff.
+    if (
         "out of host capacity" in message
         or "out of capacity" in message
+        or "out of host capacity" in blob
+        or "out of capacity" in blob
         or "limitexceeded" in code
-        or error.status == 503
-    )
+    ):
+        return CAPACITY
+
+    # 3) Known-safe transient service conditions only. Conservative retry.
+    if status in {503} or "serviceunavailable" in code or "service unavailable" in message:
+        return TRANSIENT
+
+    # 4) Everything else: 400/401/403/404/409, genuine 500 with no capacity
+    #    text, invalid shape/image/subnet/parameter. Fail immediately.
+    return NON_RETRYABLE
+
+
+def retry_delay(category: str, occurrence: int) -> float:
+    """Compute the delay (seconds) before the next attempt for a category.
+
+    Exponential backoff (base * 2**(n-1)) plus bounded random jitter so that
+    concurrent or overlapping runs do not retry in lock-step.
+    """
+    base = {
+        CAPACITY: CAPACITY_DELAY_SECONDS,
+        THROTTLED: THROTTLE_DELAY_SECONDS,
+        TRANSIENT: TRANSIENT_DELAY_SECONDS,
+    }.get(category, 0)
+    if base <= 0:
+        return 0.0
+    backoff = base * (2 ** (occurrence - 1))
+    jitter = random.uniform(0.0, float(RETRY_JITTER_SECONDS))
+    return backoff + jitter
 
 
 def instance_already_exists(compute_client, compartment_id: str) -> bool:
@@ -208,10 +283,29 @@ def main() -> int:
             compute_client, compartment_id
         )
     except ServiceError as error:
-        print(f"OCI discovery failed: {describe_service_error(error)}")
-        return 1
+        category = classify_error(error)
+        print(f"{category}: OCI discovery failed: {describe_service_error(error)}")
+        # Discovery throttling/403s are transient and safe for the scheduler to
+        # retry; only hard configuration failures return 1.
+        return 2 if category in {THROTTLED, TRANSIENT} else 1
+
+    started = time.monotonic()
+
+    def remaining_budget() -> float:
+        return MAX_RUNTIME_SECONDS - (time.monotonic() - started)
+
+    occurrence = {CAPACITY: 0, THROTTLED: 0, TRANSIENT: 0}
 
     for attempt in range(1, MAX_ATTEMPTS + 1):
+        # Never overrun the Actions job window. If the budget is spent, stop and
+        # let the next scheduled run retry, rather than being killed mid-flight.
+        if remaining_budget() <= RUN_RESERVE_SECONDS and attempt > 1:
+            print(
+                "BUDGET: run-time budget exhausted; stopping in-run retries. "
+                "The next scheduled run will retry."
+            )
+            break
+
         availability_domain = ads[(attempt - 1) % len(ads)]
         print(
             f"[Attempt {attempt}/{MAX_ATTEMPTS}] "
@@ -253,21 +347,31 @@ def main() -> int:
             )
             return 0
         except ServiceError as error:
-            if is_capacity_error(error):
-                print(
-                    "Capacity unavailable for this attempt: "
-                    f"{error.message or str(error)}"
-                )
-            else:
-                print(
-                    "Non-capacity OCI error: "
-                    f"status={error.status}; message={error.message or str(error)}"
-                )
+            category = classify_error(error)
+            summary = describe_service_error(error)
+
+            if category == NON_RETRYABLE:
+                print(f"NON-RETRYABLE: {summary}")
                 return 1
 
+            occurrence[category] += 1
+            if category == CAPACITY:
+                print(f"CAPACITY: {summary} Retrying with long backoff...")
+            elif category == THROTTLED:
+                print(f"THROTTLED: {summary} Backing off...")
+            else:
+                print(f"TRANSIENT: {summary} Conservative retry...")
+
+        # Only sleep if another attempt remains AND the delay fits the budget.
         if attempt < MAX_ATTEMPTS:
-            delay = RETRY_DELAY_SECONDS * attempt
-            print(f"Waiting {delay}s before next attempt...")
+            delay = retry_delay(category, occurrence[category])
+            if delay >= remaining_budget() - RUN_RESERVE_SECONDS:
+                print(
+                    "BUDGET: next backoff would exceed the run-time budget; "
+                    "deferring to the next scheduled run."
+                )
+                break
+            print(f"Waiting {delay:.0f}s before next attempt...")
             time.sleep(delay)
 
     print("No instance created in this run. The next scheduled run will retry.")

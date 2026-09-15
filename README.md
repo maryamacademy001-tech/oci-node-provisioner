@@ -25,11 +25,53 @@ The workflow does **not** create a smaller Micro VM as a fallback.
 
 If A1 Flex capacity is unavailable, it:
 1. Tries configured/discovered Availability Domains.
-2. Retries only a few times in the current workflow.
-3. Exits without silently changing the requested shape.
-4. Lets the next scheduled GitHub Actions run try again.
+2. Retries with per-category exponential backoff + jitter, bounded by a run-time budget.
+3. Exits with code 2 (retryable exhaustion) and lets the next scheduled run retry.
+4. Never silently changes the requested shape.
 
 This prevents accidental provisioning of the wrong instance size.
+
+## Error Classification & Throttling
+
+Every OCI `ServiceError` is classified into exactly one category. Logs are
+prefixed with the category name (`CAPACITY:`, `THROTTLED:`, `TRANSIENT:`,
+`NON-RETRYABLE:`) so failures are unambiguous.
+
+| Category | Signals | Action | Base delay |
+|---|---|---|---|
+| `CAPACITY` | `Out of host capacity`, `out of capacity`, `LimitExceeded` | retry, long backoff | `OCI_CAPACITY_DELAY_SECONDS` (120s) |
+| `THROTTLED` | HTTP 429, `TooManyRequests`, `Too many requests` | retry, backoff + jitter | `OCI_THROTTLE_DELAY_SECONDS` (60s) |
+| `TRANSIENT` | HTTP 503 / `ServiceUnavailable` | conservative retry | `OCI_TRANSIENT_DELAY_SECONDS` (30s) |
+| `NON-RETRYABLE` | 400/401/403/404/409, generic 500 without capacity text | exit 1 immediately | none |
+
+Retry delay is `base * 2**(n-1) + jitter`, so a `CAPACITY` sequence is
+~120s then ~240s. A 429 is **never** treated as a permanent failure.
+
+## Run-Time Budget
+
+`OCI_MAX_RUNTIME_SECONDS` (default 210) caps in-run retry sleeping so the
+process always exits cleanly before the Actions job timeout
+(`timeout-minutes: 5`). If the next backoff would not fit the budget, the run
+defers to the next scheduled run instead of being killed mid-flight. The
+`*/5 * * * *` scheduler is the primary retry mechanism; in-run retries are only
+a supplement.
+
+## Idempotency
+
+Before every launch attempt, `instance_already_exists()` checks for a
+non-terminated instance with display name `erp-a1-flex-2ocpu-12gb`. If present,
+the run exits 0 without launching, so retries can never create duplicate VMs.
+
+## GitHub Actions Retry Variables
+
+```text
+OCI_MAX_ATTEMPTS=3
+OCI_MAX_RUNTIME_SECONDS=210
+OCI_CAPACITY_DELAY_SECONDS=120
+OCI_THROTTLE_DELAY_SECONDS=60
+OCI_TRANSIENT_DELAY_SECONDS=30
+OCI_RETRY_JITTER_SECONDS=30
+```
 
 ## Oracle Linux 9 ARM64
 

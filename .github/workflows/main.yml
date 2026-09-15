@@ -46,5 +46,10 @@ jobs:
           OCI_OCPUS: "2"
           OCI_MEMORY_GB: "12"
           OCI_MAX_ATTEMPTS: "3"
-          OCI_RETRY_DELAY_SECONDS: "45"
+          # Stay safely under timeout-minutes: 5 (300s).
+          OCI_MAX_RUNTIME_SECONDS: "210"
+          OCI_CAPACITY_DELAY_SECONDS: "120"
+          OCI_THROTTLE_DELAY_SECONDS: "60"
+          OCI_TRANSIENT_DELAY_SECONDS: "30"
+          OCI_RETRY_JITTER_SECONDS: "30"
         run: python "bot.py"
