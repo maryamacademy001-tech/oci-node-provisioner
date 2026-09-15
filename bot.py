@@ -21,6 +21,79 @@ def required(name: str) -> str:
     return value
 
 
+def build_config() -> dict:
+    return {
+        "user": required("OCI_USER_ID"),
+        "key_content": required("OCI_PRIVATE_KEY"),
+        "fingerprint": required("OCI_FINGERPRINT"),
+        "tenancy": required("OCI_TENANCY_ID"),
+        "region": required("OCI_REGION"),
+    }
+
+
+def preflight(config: dict) -> None:
+    """Report the shape of the OCI auth inputs without ever printing secret values."""
+    print("=== OCI Authentication Preflight ===")
+    print(f"OCI SDK version: {oci.__version__}")
+
+    key = config["key_content"]
+    header_ok = "-----BEGIN PRIVATE KEY-----" in key
+    footer_ok = "-----END PRIVATE KEY-----" in key
+    literal_bs_n = "\\n" in key
+    key_stripped = key.strip()
+    has_surrounding_ws = key_stripped != key or key != key_stripped
+    print(
+        "OCI_PRIVATE_KEY: present=YES length={0} pem_header={1} pem_footer={2} "
+        "newline_count={3} literal_\\n={4} surrounding_whitespace={5}".format(
+            len(key), header_ok, footer_ok, key.count("\n"), literal_bs_n,
+            has_surrounding_ws,
+        )
+    )
+    print(
+        "OCI_USER_ID: present=YES length={0} looks_like_ocid={1}".format(
+            len(config["user"]), config["user"].startswith("ocid1.user.oc1.")
+        )
+    )
+    print(
+        "OCI_TENANCY_ID: present=YES length={0} looks_like_ocid={1}".format(
+            len(config["tenancy"]), config["tenancy"].startswith("ocid1.tenancy.oc1.")
+        )
+    )
+    print(
+        "OCI_FINGERPRINT: present=YES length={0} colon_hex_format={1}".format(
+            len(config["fingerprint"]),
+            len(config["fingerprint"].split(":")) == 20
+            and all(len(part) == 2 for part in config["fingerprint"].split(":")),
+        )
+    )
+    print(
+        "OCI_REGION: present=YES value_len={0} region={1}".format(
+            len(config["region"]), config["region"]
+        )
+    )
+
+    try:
+        oci.config.validate_config(config)
+        print("oci.config.validate_config: PASS")
+    except Exception as exc:
+        print(f"oci.config.validate_config: FAIL ({exc})")
+
+
+def describe_service_error(error: ServiceError) -> str:
+    """Return a safe, diagnostic one-line summary of a ServiceError."""
+    parts = [
+        f"status={getattr(error, 'status', '?')}",
+        f"code={getattr(error, 'code', '?')}",
+    ]
+    request_id = getattr(error, "request_id", None)
+    if request_id:
+        parts.append(f"request_id={request_id}")
+    message = getattr(error, "message", None)
+    if message:
+        parts.append(f"message={message}")
+    return " ".join(parts)
+
+
 def get_availability_domains(identity_client, tenancy_id: str) -> list[str]:
     configured = os.getenv("OCI_AVAILABILITY_DOMAINS", "").strip()
     if configured:
@@ -90,13 +163,7 @@ def instance_already_exists(compute_client, compartment_id: str) -> bool:
 
 
 def main() -> int:
-    config = {
-        "user": required("OCI_USER_ID"),
-        "key_content": required("OCI_PRIVATE_KEY"),
-        "fingerprint": required("OCI_FINGERPRINT"),
-        "tenancy": required("OCI_TENANCY_ID"),
-        "region": required("OCI_REGION"),
-    }
+    config = build_config()
 
     tenancy_id = config["tenancy"]
     compartment_id = os.getenv("OCI_COMPARTMENT_ID", tenancy_id).strip()
@@ -110,6 +177,8 @@ def main() -> int:
     print("OS: Oracle Linux 9 ARM64")
     print(f"Boot volume: {BOOT_VOLUME_GB} GB")
     print(f"Display name: {DISPLAY_NAME}")
+
+    preflight(config)
 
     compute_client = oci.core.ComputeClient(config)
     identity_client = oci.identity.IdentityClient(config)
@@ -126,7 +195,7 @@ def main() -> int:
             compute_client, compartment_id
         )
     except ServiceError as error:
-        print(f"OCI discovery failed: {error.message or error}")
+        print(f"OCI discovery failed: {describe_service_error(error)}")
         return 1
 
     for attempt in range(1, MAX_ATTEMPTS + 1):
