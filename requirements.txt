@@ -1,3 +1,2 @@
-oci>=2.160.0
-python-dotenv>=1.0.1
+oci==2.186.0
 cryptography>=42.0.0

@@ -1,9 +1,13 @@
-name: OCI A1 Flex Provisioner
+name: OCI A1 Flex Provisioner (manual diagnostic)
 
+# This workflow is intentionally NOT scheduled. The authoritative scheduler is
+# .github/workflows/main.yml (single "*/5 * * * *" cron). Keeping this file's
+# cron enabled would trigger a second provisioning run every 5 minutes against
+# the same concurrency group, doubling OCI API calls for no benefit.
+# Run this manually (workflow_dispatch) when you need the extended auth preflight
+# (private-key parse + derived-vs-configured fingerprint match).
 on:
   workflow_dispatch:
-  schedule:
-    - cron: "*/5 * * * *"
 
 concurrency:
   group: oci-a1-flex-provisioner

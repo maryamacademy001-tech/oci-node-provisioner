@@ -155,10 +155,12 @@ def find_oracle_linux_9_arm64_image(compute_client, compartment_id: str) -> str:
 
 def is_capacity_error(error: ServiceError) -> bool:
     message = str(error).lower()
+    code = str(getattr(error, 'code', '')).lower()
     return (
         "out of host capacity" in message
         or "out of capacity" in message
-        or error.status in {409, 500, 503}
+        or "limitexceeded" in code
+        or error.status == 503
     )
 
 
@@ -202,10 +204,6 @@ def main() -> int:
         ads = get_availability_domains(identity_client, tenancy_id)
         print("Availability Domains:", ", ".join(ads))
 
-        if instance_already_exists(compute_client, compartment_id):
-            print("Nothing to do: target instance already exists.")
-            return 0
-
         image_id = find_oracle_linux_9_arm64_image(
             compute_client, compartment_id
         )
@@ -219,6 +217,10 @@ def main() -> int:
             f"[Attempt {attempt}/{MAX_ATTEMPTS}] "
             f"Requesting {TARGET_SHAPE} in {availability_domain}"
         )
+
+        if instance_already_exists(compute_client, compartment_id):
+            print("Nothing to do: target instance already exists.")
+            return 0
 
         launch_details = oci.core.models.LaunchInstanceDetails(
             display_name=DISPLAY_NAME,
@@ -264,8 +266,9 @@ def main() -> int:
                 return 1
 
         if attempt < MAX_ATTEMPTS:
-            print(f"Waiting {RETRY_DELAY_SECONDS}s before next attempt...")
-            time.sleep(RETRY_DELAY_SECONDS)
+            delay = RETRY_DELAY_SECONDS * attempt
+            print(f"Waiting {delay}s before next attempt...")
+            time.sleep(delay)
 
     print("No instance created in this run. The next scheduled run will retry.")
     return 2
